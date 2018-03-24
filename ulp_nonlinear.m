@@ -1,0 +1,287 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+clear
+close all
+clc
+
+%% config
+config.useSPICE=false;
+config.spicepath=NaN;
+addpath(genpath('matlab'))
+
+constants= get_constants(config);
+
+%% Setup Arrival and Departure Orbits
+
+
+% Provide Two Line Elements   %%%%%%%%%%%%%%%%%
+Dep_tle_str={'MOLNIYA 2-9',...             
+'1 07276U 74026A   18042.27057948  .00000121  00000-0  13303-2 0  9994',...
+'2 07276  62.8899 129.6240 6827751 288.5980  12.4440  2.45097420210456'};
+% 
+% Dep_tle_str={'AGGIESAT 4',...
+%     '1 41313U 98067HP  17324.35291052  .00069511  00000-0  26026-3 0  9997',...
+%     '2 41313  51.6366 274.9652 0004825  71.5934 288.5595 15.87232926103601'};
+
+Arr_tle_str={'AGGIESAT 4',...
+    '1 41313U 98067HP  17324.35291052  .00069511  00000-0  26026-3 0  9997',...
+    '2 41313  51.6366 274.9652 0004825  71.5934 288.5595 15.87232926103601'};
+
+% Arr_tle_str={'MOLNIYA 2-9',...             
+% '1 07276U 74026A   18042.27057948  .00000121  00000-0  13303-2 0  9994',...
+% '2 07276  62.8899 129.6240 6827751 288.5980  12.4440  2.45097420210456'};
+
+% Arr_tle_str={'Target: COSMOS 2425 (716)',...
+%     '1 29670U 06062A   17324.35552733 -.00000028  00000-0  10000-3 0  9993',...
+%     '2 29670  65.3845 299.5924 0021533 338.2090  83.6349  2.13104919 84865'};
+
+% set departure orbit
+DepIM=OrbitInputManager(constants);
+DepIM.set_TLE(Dep_tle_str,config);
+Dep_orb_elem=DepIM.get_orb_elem_vec();
+dep_epoch=DepIM.epochDM.get_ET();
+
+% set Arrival orbit
+ArrIM=OrbitInputManager(constants);
+ArrIM.set_TLE(Arr_tle_str,config);
+Arr_orb_elem=ArrIM.get_orb_elem_vec();
+arr_epoch=ArrIM.epochDM.get_ET();
+
+
+depgridlen=1;
+TFgridlen=1;
+
+% Set the Exact start date-time for transfer to begin
+dept0=DateManager(config).set_date_string('2018-1-21 12:00:00').get_ET();
+
+% Set the Exact end date-time for transfer to begin
+deptf=DateManager(config).set_date_string('2017-1-22 1:00:00').get_ET();
+
+
+% Set the minumum and maximum Transfer time interval
+TFt0=0;
+TFtf=15*60*60;
+
+disp('done')
+% Compute the EFM
+
+disp('Now running EFM')
+savefilename='saveddata/Simulation';
+efmoutput=EFMcompute_kepler(savefilename,Dep_orb_elem,dep_epoch,Arr_orb_elem,arr_epoch,depgridlen,TFgridlen,dept0,deptf,TFt0,TFtf,constants,config);
+
+%
+XA=efmoutput.inputconfig.DepOrbit_normalized;
+XB=efmoutput.inputconfig.ArrOrbit_normalized_cell{1}{1};
+t_Des=efmoutput.inputconfig.TimeFlights_normalized;
+deptime_normalized=0;
+[SimSol_Nmax,SimSol_Asol,SimSol_transferorbits]=get_Lambert_Sol_for_pair(XA,XB,t_Des,deptime_normalized,constants,config);
+
+%%
+close all
+Nrequired=0;
+Nsol= size(efmoutput.SimSol_transferorbits{1},1);
+for i=1:Nsol
+    i
+    M=efmoutput.SimSol_transferorbits{1}(i,:);
+    transorbit=convert_transferorbit_mat2struct(M);
+    if transorbit.N == Nrequired
+        break
+    end
+end
+[i,transorbit.N,Nsol]
+% uncertaintu
+
+rA=transorbit.r1;
+rB=transorbit.r2;
+v1=transorbit.v1;
+v2=transorbit.v2;
+
+t_des = transorbit.t_des;
+
+vA=transorbit.v0A;
+vB=transorbit.v0B;
+
+%% nonlinear optimization
+close all
+
+Nmc=1000;
+PP0=blkdiag((1e-4)^2*eye(3),(1e-4)^2*eye(3));
+Xrvmc=mvnrnd([rA,vA],PP0,Nmc);
+Wmc=ones(Nmc,1)/Nmc;
+
+Tvec=[0,t_des];
+
+options=optimset('Display','iter','TolX',1e-12);
+delv=fminunc(@(delv)optim_ulp(delv,Xrvmc,Wmc,rB,Tvec),v1-vA,options);
+% delv=lsqnonlin(@(delv)optim_ulp_lsqnonlin(delv,Xrvmc,Wmc,rB,Tvec),v1-vA,[],[],options);
+% delv = fminimax(@(delv)optim_ulp_lsqnonlin(delv,Xrvmc,Wmc,rB,Tvec),v1-vA,[],[],[],[],[],[],[],options);
+
+Nmctest=10000;
+Xrvmctest=mvnrnd([rA,vA],1e-2*PP0,Nmctest);
+Wmctest=ones(Nmctest,1)/Nmctest;
+
+
+Err_star=zeros(1,Nmctest);
+Err=zeros(1,Nmctest);
+
+dstar=v1-vA;
+
+for i=1:Nmctest
+    i
+    Xdelv=propagate_orbit_rv_mu([Xrvmctest(i,1),Xrvmctest(i,2),Xrvmctest(i,3),Xrvmctest(i,4)+delv(1),Xrvmctest(i,5)+delv(2),Xrvmctest(i,6)+delv(3)],Tvec,1);
+    Xstar=propagate_orbit_rv_mu([Xrvmctest(i,1),Xrvmctest(i,2),Xrvmctest(i,3),Xrvmctest(i,4)+dstar(1),Xrvmctest(i,5)+dstar(2),Xrvmctest(i,6)+dstar(3)],Tvec,1);
+    
+    Err_star(i) = norm( rB - Xstar(end,1:3) );
+    Err(i) = norm( rB - Xdelv(end,1:3) );
+    
+end
+
+%%
+close all
+bins=linspace(0,0.05*constants.normX2trueX,100);
+figure
+subplot(2,1,1)
+histogram(Err_star*constants.normX2trueX,bins,'FaceColor','r','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('nominal')
+grid
+
+subplot(2,1,2)
+histogram(Err*constants.normX2trueX,bins,'FaceColor','b','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('optimized')
+grid
+
+figure
+histogram(Err_star*constants.normX2trueX,bins,'FaceColor','r','FaceAlpha',0.4)
+hold on
+
+histogram(Err*constants.normX2trueX,bins,'FaceColor','b','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('optimized')
+grid
+
+
+%% Multistage by re-applying lambert solution at each stage
+Tstages=linspace(0,t_des,5);
+
+Nmc=1000;
+PP0_stage=PP0;
+XA_stage=[rA,vA];
+% vA_stage=vA;
+
+DELV=zeros(length(Tstages),3);
+
+for ti=1:length(Tstages)-1
+
+    [SimSol_Nmax,SimSol_Asol,SimSol_transferorbits]=get_Lambert_Sol_for_pair(XA,XB,t_des-Tstages(ti),deptime_normalized,constants,config);
+    Nsol= size(SimSol_transferorbits,1);
+    for ssol=1:Nsol
+        ssol
+        M=SimSol_transferorbits(ssol,:);
+        transorbit=convert_transferorbit_mat2struct(M);
+        if transorbit.N == Nrequired
+            break
+        end
+    end
+    
+    
+    
+    Xrvmc=mvnrnd(XA_stage,PP0_stage,Nmc);
+    Wmc=ones(Nmc,1)/Nmc;
+
+    Tvec=[0,t_des-Tstages(ti)];
+
+    options=optimset('Display','iter','TolX',1e-12);
+    delv=fminunc(@(delv)optim_ulp(delv,Xrvmc,Wmc,rB,Tvec),v1-vA,options);
+
+    DELV(ti,:)=delv;
+    
+    % propagate
+    Nprop=5000;
+    Xprop=mvnrnd(XA_stage,PP0_stage,Nprop);
+    Xdelv=zeros(size(Xprop))
+    for j=1:Nprop
+       Xdelv=propagate_orbit_rv_mu([Xprop(j,1),Xprop(j,2),Xprop(i,3),Xprop(i,4)+delv(1),Xprop(i,5)+delv(2),Xprop(i,6)+delv(3)],[0,Tstages(ti)],1); 
+    end
+end
+
+
+%% 
+% Multistage optimization direct all
+
+Nmc=300;
+Xrvmc=mvnrnd([rA,vA],blkdiag((1e-4)^2*eye(3),(1e-4)^2*eye(3)),Nmc);
+Wmc=ones(Nmc,1)/Nmc;
+options=optimset('Display','iter','TolX',1e-10,'MaxFunEvals',1e4);
+
+
+TT=linspace(0,t_des,5);
+DELV=zeros(length(TT),4);
+
+delv=v1-vA;
+
+
+alphas0=[v1-vA,zeros(1,3*(length(TT)-2))] ;
+
+alphas=fminunc(@(alphas)optim_ulp_multistage(alphas,Xrvmc,Wmc,rB,TT),alphas0,options);
+
+%%
+Nmctest=10000;
+Xrvmctest=mvnrnd([rA,vA],blkdiag((1e-5)^2*eye(3),(1e-5)^2*eye(3)),Nmctest);
+Wmctest=ones(Nmctest,1)/Nmctest;
+
+
+Err_star=zeros(1,Nmctest);
+Err=zeros(1,Nmctest);
+
+Tvec=[0,t_des];
+dstar=v1-vA;
+
+for i=1:Nmctest
+    i
+    
+
+    X=Xrvmctest(i,:);
+    for ti=1:1:length(TT)-1
+        X=propagate_orbit_rv_mu([X(1),X(2),X(3),X(4)+alphas(3*(ti-1)+1),X(5)+alphas(3*(ti-1)+2),X(6)+alphas(3*(ti-1)+3)],[TT(ti),TT(ti+1)],1);
+        X=X(end,:);
+    end
+    Xdelv=X(:)';
+
+
+    Xstar=propagate_orbit_rv_mu([Xrvmctest(i,1),Xrvmctest(i,2),Xrvmctest(i,3),Xrvmctest(i,4)+dstar(1),Xrvmctest(i,5)+dstar(2),Xrvmctest(i,6)+dstar(3)],Tvec,1);
+    
+    Err_star(i) = norm( rB - Xstar(end,1:3) );
+    Err(i) = norm( rB - Xdelv(end,1:3) );
+    
+end
+
+close all
+
+bins=linspace(0,0.05*constants.normX2trueX,100);
+figure
+subplot(2,1,1)
+histogram(Err_star*constants.normX2trueX,bins,'FaceColor','r','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('nominal')
+grid
+
+subplot(2,1,2)
+histogram(Err*constants.normX2trueX,bins,'FaceColor','b','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('optimized')
+grid
+
+figure
+histogram(Err_star*constants.normX2trueX,bins,'FaceColor','r','FaceAlpha',0.4)
+hold on
+
+histogram(Err*constants.normX2trueX,bins,'FaceColor','b','FaceAlpha',0.4)
+% yticks(linspace(0,100,11))
+title('optimized')
+grid
+
+
+
+
